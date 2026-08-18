@@ -267,16 +267,44 @@ func (s *Store) InsertClick(ctx context.Context, c Click) (Click, error) {
 		c.ClickedAt = time.Now().UnixMilli()
 	}
 	c.Day = dayOf(c.ClickedAt)
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Click{}, fmt.Errorf("begin click insert: %w", err)
+	}
+	var maxClicks int
+	if err := tx.QueryRowContext(ctx, `SELECT max_clicks FROM links WHERE code = ?`, c.Code).Scan(&maxClicks); errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
+		return Click{}, fmt.Errorf("insert click %q: link not found", c.Code)
+	} else if err != nil {
+		_ = tx.Rollback()
+		return Click{}, fmt.Errorf("check click limit: %w", err)
+	}
+	if maxClicks > 0 {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM clicks WHERE code = ?`, c.Code).Scan(&count); err != nil {
+			_ = tx.Rollback()
+			return Click{}, fmt.Errorf("count clicks for limit: %w", err)
+		}
+		if count >= maxClicks {
+			_ = tx.Rollback()
+			return Click{}, fmt.Errorf("click limit reached for %q", c.Code)
+		}
+	}
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO clicks (code, clicked_at, referer, user_agent, ip, fingerprint, day)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		c.Code, c.ClickedAt, c.Referer, c.UserAgent, c.IP, c.Fingerprint, c.Day)
 	if err != nil {
+		_ = tx.Rollback()
 		return Click{}, fmt.Errorf("insert click %q: %w", c.Code, err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
+		_ = tx.Rollback()
 		return Click{}, fmt.Errorf("last insert id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Click{}, fmt.Errorf("commit click: %w", err)
 	}
 	c.ID = id
 	return c, nil
